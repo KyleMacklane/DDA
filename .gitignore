@@ -1,0 +1,40 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+
+# Cache files
+*.log
+*.sqlite3
+*.db
+*.pid
+
+# LangChain cache
+arxiv_cache.json
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Pytest
+.cache/
+
+# VSCode
+.vscode/
+
+# Pyre type checker
+.pyre/
+
+# MyPy
+.mypy_cache/

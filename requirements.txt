@@ -1,0 +1,22 @@
+# Core LangChain dependencies
+langchain>=0.1.16
+langchain-community>=0.0.32
+langchain-core>=0.1.42
+langgraph>=0.0.34
+
+# Groq LLM support
+langchain-groq>=0.0.1
+
+# Caching
+redis>=5.0.3  # optional if using RedisCache
+langchainhub>=0.1.14
+
+# ArXiv loader and document utilities
+arxiv>=2.1.0
+tqdm>=4.66.2
+
+# Required for document splitting and schema
+tenacity>=8.2.3
+
+# Optional for future expansion
+python-dotenv>=1.0.1  # if using a .env file
