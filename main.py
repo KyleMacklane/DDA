@@ -12,6 +12,9 @@ import os
 from langchain.schema import Document
 from langchain.globals import set_llm_cache
 from langchain.cache import InMemoryCache
+from dotenv import load_dotenv
+
+load_dotenv()
 
 set_llm_cache(InMemoryCache())
 
@@ -45,8 +48,10 @@ def save_cached_result(disease, result):
 
 
 # === API Setup ===
-apiKey="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"
-groq_api_key = os.getenv("GROQ_API_KEY", apiKey)
+groq_api_key = os.getenv("GROQ_API_KEY")
+if not groq_api_key:
+    raise ValueError("GROQ_API_KEY not found in environment")
+
 groq_llm = ChatGroq(api_key=groq_api_key, model="llama3-8b-8192", temperature=0)
 
 # === Prompts and Chains ===
