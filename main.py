@@ -1,3 +1,4 @@
+# === Imports ===
 from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
 from langchain_groq import ChatGroq
@@ -5,8 +6,7 @@ from langchain_community.document_loaders import ArxivLoader
 from langchain.chains.question_answering import load_qa_chain
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langgraph.graph import StateGraph, END
-from typing import TypedDict, List
-from typing import Annotated
+from typing import TypedDict
 import json
 import os
 from langchain.schema import Document
@@ -14,21 +14,16 @@ from langchain.globals import set_llm_cache
 from langchain.cache import InMemoryCache
 from dotenv import load_dotenv
 
+
+from pdb_utils import search_pdb_structures, download_pdb_file
+
+# === Init ===
 load_dotenv()
-
 set_llm_cache(InMemoryCache())
-
-#FOR PRODUCTION
-# from langchain.cache import RedisCache
-# import redis
-
-# redis_client = redis.Redis()
-# set_llm_cache(RedisCache(redis_client))
-
-
 
 CACHE_FILE = "arxiv_cache.json"
 
+# === Cache Helpers ===
 def load_cached_result(disease):
     if os.path.exists(CACHE_FILE):
         with open(CACHE_FILE, "r") as f:
@@ -45,7 +40,6 @@ def save_cached_result(disease, result):
     cache[disease] = result
     with open(CACHE_FILE, "w") as f:
         json.dump(cache, f, indent=2)
-
 
 # === API Setup ===
 groq_api_key = os.getenv("GROQ_API_KEY")
@@ -78,7 +72,8 @@ admet_prompt = PromptTemplate(
     template="""Analyze the molecule {molecule} for its ADMET properties (Absorption, Distribution, Metabolism, Excretion, Toxicity). Give a concise profile."""
 )
 admet_chain = LLMChain(llm=groq_llm, prompt=admet_prompt)
-qa_chain = load_qa_chain(llm=groq_llm, chain_type="map_reduce") #  map_reduce is slower but more accurate, else use stuff
+
+qa_chain = load_qa_chain(llm=groq_llm, chain_type="map_reduce")
 
 # === Drug Discovery State ===
 class DrugDiscoveryState(TypedDict):
@@ -89,8 +84,9 @@ class DrugDiscoveryState(TypedDict):
     selected_molecule: str
     optimized_molecule: str
     admet_profile: str
+    pdb_path: str 
 
-
+# === Pipeline Nodes ===
 
 def extract_targets(state: DrugDiscoveryState) -> DrugDiscoveryState:
     disease = state["disease"]
@@ -98,7 +94,6 @@ def extract_targets(state: DrugDiscoveryState) -> DrugDiscoveryState:
 
     print(f"🔎 Searching ArXiv for: {search_query}")
 
-    # Cache: raw docs
     doc_cache_key = f"{disease}_docs"
     doc_cache = load_cached_result(doc_cache_key)
 
@@ -111,11 +106,6 @@ def extract_targets(state: DrugDiscoveryState) -> DrugDiscoveryState:
         docs = loader.load()
         save_cached_result(doc_cache_key, [doc.page_content for doc in docs])
 
-    # Print preview of docs for debugging
-    for i, doc in enumerate(docs):
-        print(f"\n📄 Document {i+1} preview:\n{doc.page_content[:500]}...\n")
-
-    # Split and query documents
     chunks = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50).split_documents(docs)
 
     result = qa_chain.invoke({
@@ -131,13 +121,26 @@ def extract_targets(state: DrugDiscoveryState) -> DrugDiscoveryState:
     state["selected_target"] = targets.split("\n")[0] if "\n" in targets else targets.strip()
     return state
 
+def fetch_pdb_for_target(state: DrugDiscoveryState) -> DrugDiscoveryState:
+    target = state["selected_target"]
+    print(f"📦 Searching PDB for target: {target}")
+
+    pdb_ids = search_pdb_structures(target, search_by_name=True)
+    if not pdb_ids:
+        print("❌ No PDB structures found.")
+        state["pdb_path"] = "N/A"
+        return state
+
+    file_path = download_pdb_file(pdb_ids[0])
+    print(f"📁 Downloaded PDB file: {file_path}")
+    state["pdb_path"] = file_path
+    return state
+
 def generate_molecules(state: DrugDiscoveryState) -> DrugDiscoveryState:
     print(f"🧪 Suggesting molecules for target: {state['selected_target']}")
     result = molecule_chain.invoke({"target": state["selected_target"]})
     state["molecules"] = result["text"]
     state["selected_molecule"] = result["text"].split("\n")[0]
-    
-
     return state
 
 def optimize(state: DrugDiscoveryState) -> DrugDiscoveryState:
@@ -150,23 +153,21 @@ def analyze_admet(state: DrugDiscoveryState) -> DrugDiscoveryState:
     print(f"🧬 Analyzing ADMET for: {state['selected_molecule']}")
     result = admet_chain.invoke({"molecule": state["selected_molecule"]})
     state["admet_profile"] = result["text"]
-    # print("\n🚀 Pipeline completed!")
     return state
-
-
 
 # === LangGraph Flow ===
 builder = StateGraph(DrugDiscoveryState)
 builder.add_node("FindTargets", extract_targets)
+builder.add_node("FetchPDB", fetch_pdb_for_target)  
 builder.add_node("SuggestMolecules", generate_molecules)
 builder.add_node("OptimizeMolecule", optimize)
 builder.add_node("ADMETAnalysis", analyze_admet)
 
-
 builder.set_entry_point("FindTargets")
-builder.add_edge("FindTargets", "SuggestMolecules")
+builder.add_edge("FindTargets", "FetchPDB")          
+builder.add_edge("FetchPDB", "SuggestMolecules")     
 builder.add_edge("SuggestMolecules", "OptimizeMolecule")
-builder.add_edge("OptimizeMolecule","ADMETAnalysis")
+builder.add_edge("OptimizeMolecule", "ADMETAnalysis")
 builder.add_edge("ADMETAnalysis", END)
 
 graph = builder.compile()
@@ -176,6 +177,7 @@ if __name__ == "__main__":
     result = graph.invoke({"disease": "malaria"})
 
     print("\n🎯 Targets Identified:\n", result["targets"])
+    print("\n📁 PDB Structure Path:\n", result["pdb_path"])
     print("\n🧪 Suggested Molecules:\n", result["molecules"])
     print("\n🔧 Optimized Molecule:\n", result["optimized_molecule"])
     print("\n🧬 ADMET Profile:\n", result["admet_profile"])

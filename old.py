@@ -13,9 +13,13 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.chains import AnalyzeDocumentChain
 from langchain.schema import Document
 import os
+from dotenv import load_dotenv
 
 
-apiKey="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"
+
+apiKey = os.getenv("GROQ_API_KEY")
+if not apiKey:
+    raise ValueError("GROQ_API_KEY not found in environment")
 
 
 groq_api_key = os.getenv("GROQ_API_KEY", apiKey)
