@@ -77,6 +77,63 @@ def extract_best_affinity(log: str) -> float:
                 continue
     raise ValueError("❌ No binding affinity found in log.")
 
+def run_docking(pdb_path: str, smiles_list: list[str]) -> str:
+    import tempfile
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    ligand_dir = Path("docking/ligand")
+    ligand_dir.mkdir(parents=True, exist_ok=True)
+
+    results = []
+
+    # Save receptor as pdb and convert to pdbqt
+    receptor_input = Path("docking/receptor/receptor.pdb")
+    receptor_input.write_text(Path(pdb_path).read_text())  # Copy file
+    receptor_pdbqt = "docking/receptor/receptor.pdbqt"
+    prepare_receptor_with_mgltools(str(receptor_input), receptor_pdbqt)
+
+    for idx, smi in enumerate(smiles_list):
+        ligand_name = f"ligand_{idx}"
+        sdf_path = ligand_dir / f"{ligand_name}.sdf"
+        pdbqt_path = ligand_dir / f"{ligand_name}.pdbqt"
+
+        # Convert SMILES to SDF
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            print(f"❌ Invalid SMILES: {smi}")
+            continue
+        mol = Chem.AddHs(mol)
+        AllChem.EmbedMolecule(mol)
+        AllChem.UFFOptimizeMolecule(mol)
+        writer = Chem.SDWriter(str(sdf_path))
+        writer.write(mol)
+        writer.close()
+
+        try:
+            # Prepare and dock
+            clean_and_prepare_ligand(str(sdf_path), str(pdbqt_path))
+            log = run_vina_docking(
+                receptor_pdbqt,
+                str(pdbqt_path),
+                center=(0.0, 0.0, 0.0),
+                size=(20.0, 20.0, 20.0)
+            )
+            affinity = extract_best_affinity(log)
+
+            if affinity > -5.0:
+                strength = "🔴 Weak binding"
+            elif -7.0 < affinity <= -5.0:
+                strength = "🟡 Moderate binding"
+            else:
+                strength = "🟢 Strong binding"
+
+            results.append(f"{ligand_name}: {affinity:.2f} kcal/mol → {strength}")
+        except Exception as e:
+            results.append(f"{ligand_name}: ❌ Error → {e}")
+
+    return "\n".join(results)
+
 
 # 🧪 Example usage
 if __name__ == "__main__":

@@ -9,17 +9,33 @@ from langgraph.graph import StateGraph, END
 from typing import TypedDict
 import json
 import os
+import time
 from langchain.schema import Document
 from langchain.globals import set_llm_cache
 from langchain.cache import InMemoryCache
 from dotenv import load_dotenv
 
+import sys
+from pdb_utils import  prepare_target_and_ligands
 
-from pdb_utils import search_pdb_structures, download_pdb_file
+sys.path.append("docking")  
+from docking import run_docking
+
+
+
 
 # === Init ===
 load_dotenv()
+# === API Setup ===
+groq_api_key = os.getenv("GROQ_API_KEY")
+if not groq_api_key:
+    raise ValueError("GROQ_API_KEY not found in environment")
+
+groq_llm = ChatGroq(api_key=groq_api_key, model="llama3-8b-8192", temperature=0)
+
+# === Cache Setup ===
 set_llm_cache(InMemoryCache())
+
 
 CACHE_FILE = "arxiv_cache.json"
 
@@ -41,12 +57,6 @@ def save_cached_result(disease, result):
     with open(CACHE_FILE, "w") as f:
         json.dump(cache, f, indent=2)
 
-# === API Setup ===
-groq_api_key = os.getenv("GROQ_API_KEY")
-if not groq_api_key:
-    raise ValueError("GROQ_API_KEY not found in environment")
-
-groq_llm = ChatGroq(api_key=groq_api_key, model="llama3-8b-8192", temperature=0)
 
 # === Prompts and Chains ===
 target_prompt = PromptTemplate(
@@ -63,8 +73,15 @@ molecule_chain = LLMChain(llm=groq_llm, prompt=molecule_prompt)
 
 optimize_prompt = PromptTemplate(
     input_variables=["molecule"],
-    template="""You are optimizing a drug candidate. Improve the molecule {molecule} for better bioavailability and lower toxicity. Provide a rationale."""
+    template="""You are optimizing a drug candidate. The molecule is: {molecule}. Suggest an optimized version with:
+    1. A new SMILES string (must start with 'C' and be on its own line)
+    2. A brief rationale for the changes
+    
+    Example output:
+    C1=CC=CC=C1
+    Simplified to benzene ring for better stability"""
 )
+
 optimize_chain = LLMChain(llm=groq_llm, prompt=optimize_prompt)
 
 admet_prompt = PromptTemplate(
@@ -85,6 +102,8 @@ class DrugDiscoveryState(TypedDict):
     optimized_molecule: str
     admet_profile: str
     pdb_path: str 
+    ligands:list
+    docking_results: str
 
 # === Pipeline Nodes ===
 
@@ -108,6 +127,7 @@ def extract_targets(state: DrugDiscoveryState) -> DrugDiscoveryState:
 
     chunks = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50).split_documents(docs)
 
+    
     result = qa_chain.invoke({
         "input_documents": chunks,
         "question": f"What are the top protein or gene drug targets of the {disease} pathogen according to this paper?"
@@ -118,22 +138,48 @@ def extract_targets(state: DrugDiscoveryState) -> DrugDiscoveryState:
     save_cached_result(target_cache_key, targets)
 
     state["targets"] = targets
-    state["selected_target"] = targets.split("\n")[0] if "\n" in targets else targets.strip()
+    raw_target = targets.split("\n")[0]
+    clean_target = raw_target.split("-")[0].strip()  
+    state["selected_target"] = clean_target
     return state
 
 def fetch_pdb_for_target(state: DrugDiscoveryState) -> DrugDiscoveryState:
-    target = state["selected_target"]
-    print(f"📦 Searching PDB for target: {target}")
+    target_name = state["selected_target"]
+    molecule_output = state.get("optimized_molecule", "")
+    
+    print(f"🔎 Fetching PDB and ligands for: {target_name}")
 
-    pdb_ids = search_pdb_structures(target, search_by_name=True)
-    if not pdb_ids:
-        print("❌ No PDB structures found.")
+    # Extract SMILES - more robust version
+    smiles = None
+    for line in molecule_output.split('\n'):
+        line = line.strip()
+        if (line.startswith(('C', 'O', 'N', 'S', 'c', 'n'))  # Common SMILES starters
+            and any(c.isdigit() for c in line)  # Contains numbers (ring markers)
+            and not ' ' in line):  # No spaces
+            smiles = line
+            break
+    
+    if not smiles:
+        print("⚠️ Could not extract valid SMILES from optimized molecule")
         state["pdb_path"] = "N/A"
+        state["ligands"] = []
         return state
 
-    file_path = download_pdb_file(pdb_ids[0])
-    print(f"📁 Downloaded PDB file: {file_path}")
-    state["pdb_path"] = file_path
+    try:
+        # Get receptor and natural ligands
+        receptor_path, ligand_paths = prepare_target_and_ligands(target_name)
+        
+        # Store the SMILES string directly (not file path)
+        state["pdb_path"] = receptor_path
+        state["ligands"] = [smiles]  # Store as SMILES string
+        print(f"✅ Receptor: {receptor_path}")
+        print(f"🧪 Ligand SMILES: {smiles}")
+        
+    except Exception as e:
+        print(f"❌ Preparation failed: {e}")
+        state["pdb_path"] = "N/A"
+        state["ligands"] = []
+    
     return state
 
 def generate_molecules(state: DrugDiscoveryState) -> DrugDiscoveryState:
@@ -155,20 +201,41 @@ def analyze_admet(state: DrugDiscoveryState) -> DrugDiscoveryState:
     state["admet_profile"] = result["text"]
     return state
 
+def perform_docking(state: DrugDiscoveryState) -> DrugDiscoveryState:
+    if state["pdb_path"] == "N/A" or not state["ligands"]:
+        state["docking_results"] = "Docking skipped: missing structure or ligands."
+        return state
+    
+    try:
+        # Pass SMILES strings directly
+        docking_summary = run_docking(
+            pdb_path=state["pdb_path"],
+            smiles_list=state["ligands"]  # contains SMILES strings
+        )
+        state["docking_results"] = docking_summary
+    except Exception as e:
+        state["docking_results"] = f"Docking failed: {str(e)}"
+    
+    return state
+
+
 # === LangGraph Flow ===
 builder = StateGraph(DrugDiscoveryState)
 builder.add_node("FindTargets", extract_targets)
 builder.add_node("FetchPDB", fetch_pdb_for_target)  
 builder.add_node("SuggestMolecules", generate_molecules)
 builder.add_node("OptimizeMolecule", optimize)
+builder.add_node("Docking", perform_docking)
 builder.add_node("ADMETAnalysis", analyze_admet)
 
 builder.set_entry_point("FindTargets")
-builder.add_edge("FindTargets", "FetchPDB")          
-builder.add_edge("FetchPDB", "SuggestMolecules")     
+builder.add_edge("FindTargets", "SuggestMolecules")
 builder.add_edge("SuggestMolecules", "OptimizeMolecule")
-builder.add_edge("OptimizeMolecule", "ADMETAnalysis")
-builder.add_edge("ADMETAnalysis", END)
+builder.add_edge("OptimizeMolecule", "FetchPDB") 
+builder.add_edge("FetchPDB", "ADMETAnalysis")
+builder.add_edge("ADMETAnalysis", "Docking")
+builder.add_edge("Docking", END)
+
 
 graph = builder.compile()
 
@@ -181,3 +248,6 @@ if __name__ == "__main__":
     print("\n🧪 Suggested Molecules:\n", result["molecules"])
     print("\n🔧 Optimized Molecule:\n", result["optimized_molecule"])
     print("\n🧬 ADMET Profile:\n", result["admet_profile"])
+    print("🧬 Using molecule for docking:", result["optimized_molecule"])
+    print("📦 Using PDB structure at:", result["pdb_path"])
+    print("\n🚀 Docking Results:\n", result["docking_results"])
